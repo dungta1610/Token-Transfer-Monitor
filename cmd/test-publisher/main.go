@@ -45,10 +45,11 @@ func main() {
 	}
 
 	headers := amqp.Table{
-		"x-event-id":     msg.EventID,
-		"x-event-type":   msg.EventType,
-		"x-chain-id":     msg.ChainID,
-		"x-published-at": time.Now().UTC().Format(time.RFC3339Nano),
+		broker.HeaderEventID:     msg.EventID,
+		broker.HeaderEventType:   msg.EventType,
+		broker.HeaderChainID:     msg.ChainID,
+		broker.HeaderRetryCount:  0,
+		broker.HeaderPublishedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}
 
 	err = broker.PublishJSON(

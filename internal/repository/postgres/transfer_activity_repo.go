@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type TransferActivityRecord struct {
@@ -26,11 +24,11 @@ type TransferActivityRecord struct {
 }
 
 type TransferActivityRepo struct {
-	pool *pgxpool.Pool
+	db DBTX
 }
 
-func NewTransferActivityRepo(pool *pgxpool.Pool) *TransferActivityRepo {
-	return &TransferActivityRepo{pool: pool}
+func NewTransferActivityRepo(db DBTX) *TransferActivityRepo {
+	return &TransferActivityRepo{db: db}
 }
 
 func (r *TransferActivityRepo) Insert(ctx context.Context, record TransferActivityRecord) error {
@@ -53,7 +51,7 @@ func (r *TransferActivityRepo) Insert(ctx context.Context, record TransferActivi
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 	`
 
-	_, err := r.pool.Exec(
+	_, err := r.db.Exec(
 		ctx,
 		query,
 		record.EventID,

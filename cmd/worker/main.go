@@ -10,7 +10,6 @@ import (
 	"token-transfer-monitor/internal/broker"
 	"token-transfer-monitor/internal/config"
 	"token-transfer-monitor/internal/contract"
-	pgrepo "token-transfer-monitor/internal/repository/postgres"
 	"token-transfer-monitor/internal/service"
 	"token-transfer-monitor/internal/storage"
 )
@@ -62,18 +61,18 @@ func main() {
 		log.Fatalf("consume queue: %v", err)
 	}
 
-	processedRepo := pgrepo.NewProcessedEventRepo(pool)
-	activityRepo := pgrepo.NewTransferActivityRepo(pool)
-	processor := service.NewTransferProcessor(
-		processedRepo,
-		activityRepo,
-		cfg.Blockchain.WatchlistAddrs,
+	processor := service.NewTransferProcessor(pool, cfg.Blockchain.WatchlistAddrs)
+
+	log.Printf(
+		"worker started; queue=%s consumer_tag=%s max_retry=%d retry_delay_ms=%d",
+		cfg.RabbitMQ.Topology.TransferQueue,
+		cfg.Worker.ConsumerTag,
+		cfg.Worker.MaxRetryCount,
+		cfg.Worker.RetryDelayMS,
 	)
 
-	log.Printf("worker started; queue=%s consumer_tag=%s", cfg.RabbitMQ.Topology.TransferQueue, cfg.Worker.ConsumerTag)
-
 	for d := range deliveries {
-		handleDelivery(ctx, d, processor)
+		handleDelivery(ctx, d, session.Channel, *cfg, processor)
 	}
 
 	log.Println("delivery channel closed, worker exiting")
@@ -82,14 +81,30 @@ func main() {
 func handleDelivery(
 	parentCtx context.Context,
 	d amqp.Delivery,
+	ch *amqp.Channel,
+	cfg config.Config,
 	processor *service.TransferProcessor,
 ) {
 	processCtx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
 	defer cancel()
 
+	retryCount, err := broker.GetRetryCount(d.Headers)
+	if err != nil {
+		log.Printf("invalid retry header -> send to DLQ | headers=%v err=%v", d.Headers, err)
+		if nackErr := d.Nack(false, false); nackErr != nil {
+			log.Printf("nack delivery failed: %v", nackErr)
+		}
+		return
+	}
+
 	msg, err := contract.ParseTransferDetectedMessage(d.Body)
 	if err != nil {
-		log.Printf("invalid message body -> send to DLQ | err=%v body=%s", err, string(d.Body))
+		log.Printf(
+			"invalid message body -> send to DLQ | retry_count=%d err=%v body=%s",
+			retryCount,
+			err,
+			string(d.Body),
+		)
 		if nackErr := d.Nack(false, false); nackErr != nil {
 			log.Printf("nack delivery failed: %v", nackErr)
 		}
@@ -101,9 +116,10 @@ func handleDelivery(
 		switch {
 		case service.IsPermanentError(err):
 			log.Printf(
-				"permanent processing error -> send to DLQ | event_id=%s tx_hash=%s err=%v",
+				"permanent processing error -> send to DLQ | event_id=%s tx_hash=%s retry_count=%d err=%v",
 				msg.EventID,
 				msg.TxHash,
+				retryCount,
 				err,
 			)
 			if nackErr := d.Nack(false, false); nackErr != nil {
@@ -112,22 +128,61 @@ func handleDelivery(
 			return
 
 		case service.IsRetryableError(err):
+			if retryCount >= cfg.Worker.MaxRetryCount {
+				log.Printf(
+					"retry limit exceeded -> send to DLQ | event_id=%s tx_hash=%s retry_count=%d max_retry=%d err=%v",
+					msg.EventID,
+					msg.TxHash,
+					retryCount,
+					cfg.Worker.MaxRetryCount,
+					err,
+				)
+				if nackErr := d.Nack(false, false); nackErr != nil {
+					log.Printf("nack delivery failed: %v", nackErr)
+				}
+				return
+			}
+
+			if pubErr := broker.PublishToRetryQueue(
+				processCtx,
+				ch,
+				cfg,
+				d.Body,
+				d.Headers,
+				retryCount,
+			); pubErr != nil {
+				log.Printf(
+					"publish retry copy failed -> requeue original | event_id=%s tx_hash=%s retry_count=%d err=%v",
+					msg.EventID,
+					msg.TxHash,
+					retryCount,
+					pubErr,
+				)
+				if nackErr := d.Nack(false, true); nackErr != nil {
+					log.Printf("nack requeue original failed: %v", nackErr)
+				}
+				return
+			}
+
 			log.Printf(
-				"retryable processing error -> currently send to DLQ in phase-1 | event_id=%s tx_hash=%s err=%v",
+				"published to retry queue | event_id=%s tx_hash=%s current_retry=%d next_retry=%d",
 				msg.EventID,
 				msg.TxHash,
-				err,
+				retryCount,
+				retryCount+1,
 			)
-			if nackErr := d.Nack(false, false); nackErr != nil {
-				log.Printf("nack delivery failed: %v", nackErr)
+
+			if ackErr := d.Ack(false); ackErr != nil {
+				log.Printf("ack original after retry publish failed: %v", ackErr)
 			}
 			return
 
 		default:
 			log.Printf(
-				"unexpected processing error -> send to DLQ | event_id=%s tx_hash=%s err=%v",
+				"unexpected processing error -> send to DLQ | event_id=%s tx_hash=%s retry_count=%d err=%v",
 				msg.EventID,
 				msg.TxHash,
+				retryCount,
 				err,
 			)
 			if nackErr := d.Nack(false, false); nackErr != nil {
@@ -140,23 +195,26 @@ func handleDelivery(
 	switch result.Result {
 	case service.ProcessResultSuccess:
 		log.Printf(
-			"processed successfully | event_id=%s tx_hash=%s result=%s",
+			"processed successfully | event_id=%s tx_hash=%s retry_count=%d result=%s",
 			msg.EventID,
 			msg.TxHash,
+			retryCount,
 			result.Result,
 		)
 	case service.ProcessResultDuplicate:
 		log.Printf(
-			"duplicate detected, ack without side effect | event_id=%s tx_hash=%s result=%s",
+			"duplicate detected, ack without side effect | event_id=%s tx_hash=%s retry_count=%d result=%s",
 			msg.EventID,
 			msg.TxHash,
+			retryCount,
 			result.Result,
 		)
 	default:
 		log.Printf(
-			"processed with status | event_id=%s tx_hash=%s result=%s",
+			"processed with status | event_id=%s tx_hash=%s retry_count=%d result=%s",
 			msg.EventID,
 			msg.TxHash,
+			retryCount,
 			result.Result,
 		)
 	}

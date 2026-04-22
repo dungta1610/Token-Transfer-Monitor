@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type ProcessedEventRecord struct {
@@ -18,11 +16,11 @@ type ProcessedEventRecord struct {
 }
 
 type ProcessedEventRepo struct {
-	pool *pgxpool.Pool
+	db DBTX
 }
 
-func NewProcessedEventRepo(pool *pgxpool.Pool) *ProcessedEventRepo {
-	return &ProcessedEventRepo{pool: pool}
+func NewProcessedEventRepo(db DBTX) *ProcessedEventRepo {
+	return &ProcessedEventRepo{db: db}
 }
 
 func (r *ProcessedEventRepo) Exists(ctx context.Context, eventID string) (bool, error) {
@@ -35,7 +33,7 @@ func (r *ProcessedEventRepo) Exists(ctx context.Context, eventID string) (bool, 
 	`
 
 	var exists bool
-	if err := r.pool.QueryRow(ctx, query, eventID).Scan(&exists); err != nil {
+	if err := r.db.QueryRow(ctx, query, eventID).Scan(&exists); err != nil {
 		return false, fmt.Errorf("check processed event exists: %w", err)
 	}
 
@@ -54,7 +52,7 @@ func (r *ProcessedEventRepo) Insert(ctx context.Context, record ProcessedEventRe
 		) VALUES ($1, $2, $3, $4, $5, $6)
 	`
 
-	_, err := r.pool.Exec(
+	_, err := r.db.Exec(
 		ctx,
 		query,
 		record.EventID,
