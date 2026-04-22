@@ -106,7 +106,7 @@ func Load() (*Config, error) {
 		},
 		Postgres: PostgresConfig{
 			Host:         getString("POSTGRES_HOST", "localhost"),
-			Port:         getInt("POSTGRES_PORT", 5432),
+			Port:         getInt("POSTGRES_PORT", 5434),
 			DB:           getString("POSTGRES_DB", "ttm"),
 			User:         getString("POSTGRES_USER", "ttm"),
 			Password:     getString("POSTGRES_PASSWORD", "ttm_password"),
