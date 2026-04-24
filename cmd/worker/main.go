@@ -40,6 +40,10 @@ func main() {
 	}
 	defer session.Close()
 
+	if err := broker.EnablePublisherConfirms(session.Channel); err != nil {
+		log.Fatalf("enable publisher confirms: %v", err)
+	}
+
 	if err := broker.DeclareTopology(session.Channel, *cfg); err != nil {
 		log.Fatalf("declare topology: %v", err)
 	}
@@ -64,7 +68,7 @@ func main() {
 	processor := service.NewTransferProcessor(pool, cfg.Blockchain.WatchlistAddrs)
 
 	log.Printf(
-		"worker started; queue=%s consumer_tag=%s max_retry=%d retry_delay_ms=%d",
+		"worker started; queue=%s consumer_tag=%s max_retry=%d retry_delay_ms=%d publisher_confirms=true",
 		cfg.RabbitMQ.Topology.TransferQueue,
 		cfg.Worker.ConsumerTag,
 		cfg.Worker.MaxRetryCount,
@@ -152,7 +156,7 @@ func handleDelivery(
 				retryCount,
 			); pubErr != nil {
 				log.Printf(
-					"publish retry copy failed -> requeue original | event_id=%s tx_hash=%s retry_count=%d err=%v",
+					"publish retry copy with confirm failed -> requeue original | event_id=%s tx_hash=%s retry_count=%d err=%v",
 					msg.EventID,
 					msg.TxHash,
 					retryCount,
@@ -165,7 +169,7 @@ func handleDelivery(
 			}
 
 			log.Printf(
-				"published to retry queue | event_id=%s tx_hash=%s current_retry=%d next_retry=%d",
+				"published to retry queue and confirmed by broker | event_id=%s tx_hash=%s current_retry=%d next_retry=%d",
 				msg.EventID,
 				msg.TxHash,
 				retryCount,
@@ -173,7 +177,7 @@ func handleDelivery(
 			)
 
 			if ackErr := d.Ack(false); ackErr != nil {
-				log.Printf("ack original after retry publish failed: %v", ackErr)
+				log.Printf("ack original after confirmed retry publish failed: %v", ackErr)
 			}
 			return
 

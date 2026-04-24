@@ -19,7 +19,7 @@ func PublishToRetryQueue(
 ) error {
 	newHeaders := SetRetryCount(headers, currentRetryCount+1)
 
-	err := PublishJSON(
+	err := PublishJSONWithConfirm(
 		ctx,
 		ch,
 		cfg.RabbitMQ.Topology.RetryExchange,
@@ -29,7 +29,7 @@ func PublishToRetryQueue(
 		true,
 	)
 	if err != nil {
-		return fmt.Errorf("publish to retry queue: %w", err)
+		return fmt.Errorf("publish retry message with confirm: %w", err)
 	}
 
 	return nil

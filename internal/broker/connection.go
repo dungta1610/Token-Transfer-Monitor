@@ -60,6 +60,18 @@ func (s *Session) Close() error {
 	return s.Channel.Close()
 }
 
+func EnablePublisherConfirms(ch *amqp.Channel) error {
+	if ch == nil {
+		return fmt.Errorf("amqp channel is nil")
+	}
+
+	if err := ch.Confirm(false); err != nil {
+		return fmt.Errorf("enable publisher confirms: %w", err)
+	}
+
+	return nil
+}
+
 func PublishJSON(
 	ctx context.Context,
 	ch *amqp.Channel,
@@ -97,6 +109,60 @@ func PublishJSON(
 	)
 	if err != nil {
 		return fmt.Errorf("publish message: %w", err)
+	}
+
+	return nil
+}
+
+func PublishJSONWithConfirm(
+	ctx context.Context,
+	ch *amqp.Channel,
+	exchange string,
+	routingKey string,
+	body []byte,
+	headers amqp.Table,
+	persistent bool,
+) error {
+	if ch == nil {
+		return fmt.Errorf("amqp channel is nil")
+	}
+
+	deliveryMode := uint8(amqp.Transient)
+	if persistent {
+		deliveryMode = amqp.Persistent
+	}
+
+	pubCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	confirm, err := ch.PublishWithDeferredConfirmWithContext(
+		pubCtx,
+		exchange,
+		routingKey,
+		false,
+		false,
+		amqp.Publishing{
+			ContentType:  "application/json",
+			Body:         body,
+			Headers:      headers,
+			DeliveryMode: deliveryMode,
+			Timestamp:    time.Now().UTC(),
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("publish message with confirm: %w", err)
+	}
+
+	if confirm == nil {
+		return fmt.Errorf("publisher confirm is nil; confirm mode may not be enabled")
+	}
+
+	ok, err := confirm.WaitContext(pubCtx)
+	if err != nil {
+		return fmt.Errorf("wait publisher confirm: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("publisher confirm was not acknowledged by broker")
 	}
 
 	return nil
