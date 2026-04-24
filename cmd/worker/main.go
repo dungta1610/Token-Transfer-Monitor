@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
+	"sync"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -11,11 +13,20 @@ import (
 	"token-transfer-monitor/internal/config"
 	"token-transfer-monitor/internal/contract"
 	"token-transfer-monitor/internal/service"
+	"token-transfer-monitor/internal/shutdown"
 	"token-transfer-monitor/internal/storage"
 )
 
+const reconnectDelay = 3 * time.Second
+
+type workerSession struct {
+	conn    *broker.Connection
+	session *broker.Session
+}
+
 func main() {
-	ctx := context.Background()
+	ctx, stop := shutdown.NewSignalContext()
+	defer stop()
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -28,31 +39,72 @@ func main() {
 	}
 	defer pool.Close()
 
-	conn, err := broker.NewConnection(cfg.RabbitMQ.AMQPURL)
+	processor := service.NewTransferProcessor(pool, cfg.Blockchain.WatchlistAddrs)
+
+	log.Printf(
+		"worker supervisor started; queue=%s consumer_tag=%s reconnect_delay=%s",
+		cfg.RabbitMQ.Topology.TransferQueue,
+		cfg.Worker.ConsumerTag,
+		reconnectDelay,
+	)
+
+	for {
+		if ctx.Err() != nil {
+			log.Println("worker supervisor received shutdown signal")
+			return
+		}
+
+		err := runConsumerSession(ctx, *cfg, processor)
+		if err == nil {
+			log.Println("consumer session stopped cleanly")
+			return
+		}
+
+		if ctx.Err() != nil {
+			log.Printf("consumer session stopped because context was cancelled: %v", ctx.Err())
+			return
+		}
+
+		log.Printf("consumer session failed: %v", err)
+		log.Printf("reconnecting in %s...", reconnectDelay)
+
+		select {
+		case <-ctx.Done():
+			log.Println("shutdown while waiting to reconnect")
+			return
+		case <-time.After(reconnectDelay):
+		}
+	}
+}
+
+func runConsumerSession(
+	ctx context.Context,
+	cfg config.Config,
+	processor *service.TransferProcessor,
+) error {
+	ws, err := openWorkerSession(cfg)
 	if err != nil {
-		log.Fatalf("connect rabbitmq: %v", err)
+		return err
 	}
-	defer conn.Close()
+	defer ws.close()
 
-	session, err := conn.OpenSession()
-	if err != nil {
-		log.Fatalf("open rabbitmq session: %v", err)
-	}
-	defer session.Close()
+	connClosed := ws.session.Conn.NotifyClose(make(chan *amqp.Error, 1))
+	chClosed := ws.session.Channel.NotifyClose(make(chan *amqp.Error, 1))
+	consumerCancelled := ws.session.Channel.NotifyCancel(make(chan string, 1))
 
-	if err := broker.EnablePublisherConfirms(session.Channel); err != nil {
-		log.Fatalf("enable publisher confirms: %v", err)
+	if err := broker.EnablePublisherConfirms(ws.session.Channel); err != nil {
+		return err
 	}
 
-	if err := broker.DeclareTopology(session.Channel, *cfg); err != nil {
-		log.Fatalf("declare topology: %v", err)
+	if err := broker.DeclareTopology(ws.session.Channel, cfg); err != nil {
+		return err
 	}
 
-	if err := session.Channel.Qos(cfg.Worker.PrefetchCount, 0, false); err != nil {
-		log.Fatalf("set qos: %v", err)
+	if err := ws.session.Channel.Qos(cfg.Worker.PrefetchCount, 0, false); err != nil {
+		return err
 	}
 
-	deliveries, err := session.Channel.Consume(
+	deliveries, err := ws.session.Channel.Consume(
 		cfg.RabbitMQ.Topology.TransferQueue,
 		cfg.Worker.ConsumerTag,
 		false,
@@ -62,24 +114,111 @@ func main() {
 		nil,
 	)
 	if err != nil {
-		log.Fatalf("consume queue: %v", err)
+		return err
 	}
 
-	processor := service.NewTransferProcessor(pool, cfg.Blockchain.WatchlistAddrs)
+	var wg sync.WaitGroup
+	sessionDone := make(chan error, 1)
 
 	log.Printf(
-		"worker started; queue=%s consumer_tag=%s max_retry=%d retry_delay_ms=%d publisher_confirms=true",
+		"consumer session started; queue=%s consumer_tag=%s max_retry=%d retry_delay_ms=%d publisher_confirms=true",
 		cfg.RabbitMQ.Topology.TransferQueue,
 		cfg.Worker.ConsumerTag,
 		cfg.Worker.MaxRetryCount,
 		cfg.Worker.RetryDelayMS,
 	)
 
-	for d := range deliveries {
-		handleDelivery(ctx, d, session.Channel, *cfg, processor)
+	go func() {
+		for d := range deliveries {
+			wg.Add(1)
+
+			delivery := d
+			go func() {
+				defer wg.Done()
+				handleDelivery(ctx, delivery, ws.session.Channel, cfg, processor)
+			}()
+		}
+
+		wg.Wait()
+		sessionDone <- nil
+	}()
+
+	select {
+	case <-ctx.Done():
+		log.Println("shutdown requested, cancelling consumer")
+
+		cancelCtx, cancel := shutdown.WithTimeout(context.Background(), cfg.Shutdown.Timeout)
+		defer cancel()
+
+		cancelErr := ws.session.Channel.Cancel(cfg.Worker.ConsumerTag, false)
+		if cancelErr != nil {
+			log.Printf("cancel consumer failed: %v", cancelErr)
+		}
+
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			log.Println("in-flight deliveries drained")
+			return nil
+		case <-cancelCtx.Done():
+			return errors.New("shutdown timeout while draining deliveries")
+		}
+
+	case err := <-connClosed:
+		if err == nil {
+			return errors.New("rabbitmq connection closed")
+		}
+		return err
+
+	case err := <-chClosed:
+		if err == nil {
+			return errors.New("rabbitmq channel closed")
+		}
+		return err
+
+	case tag := <-consumerCancelled:
+		return errors.New("consumer cancelled by broker: " + tag)
+
+	case err := <-sessionDone:
+		return err
+	}
+}
+
+func openWorkerSession(cfg config.Config) (*workerSession, error) {
+	conn, err := broker.NewConnection(cfg.RabbitMQ.AMQPURL)
+	if err != nil {
+		return nil, err
 	}
 
-	log.Println("delivery channel closed, worker exiting")
+	session, err := conn.OpenSession()
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+
+	return &workerSession{
+		conn:    conn,
+		session: session,
+	}, nil
+}
+
+func (s *workerSession) close() {
+	if s == nil {
+		return
+	}
+
+	if s.session != nil {
+		_ = s.session.Close()
+	}
+
+	if s.conn != nil {
+		_ = s.conn.Close()
+	}
 }
 
 func handleDelivery(
