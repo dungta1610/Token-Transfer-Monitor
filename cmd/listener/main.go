@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -10,7 +11,9 @@ import (
 	"token-transfer-monitor/internal/blockchain"
 	"token-transfer-monitor/internal/broker"
 	"token-transfer-monitor/internal/config"
+	pgrepo "token-transfer-monitor/internal/repository/postgres"
 	"token-transfer-monitor/internal/shutdown"
+	"token-transfer-monitor/internal/storage"
 )
 
 const reconnectDelay = 3 * time.Second
@@ -24,10 +27,35 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
+	pool, err := storage.NewPostgresPool(ctx, cfg.Postgres)
+	if err != nil {
+		log.Fatalf("connect postgres: %v", err)
+	}
+	defer pool.Close()
+
+	tokenRepo := pgrepo.NewTrackedTokenRepo(pool)
+
+	trackedTokenAddresses, err := tokenRepo.ListActiveAddresses(ctx, cfg.Blockchain.ChainID)
+	if err != nil {
+		log.Fatalf("load tracked tokens from postgres: %v", err)
+	}
+
+	if len(trackedTokenAddresses) == 0 {
+		trackedTokenAddresses = cfg.Blockchain.TrackedTokenAddrs
+		log.Printf(
+			"no active tracked tokens found in postgres, fallback to env; token_count=%d",
+			len(trackedTokenAddresses),
+		)
+	}
+
+	if len(trackedTokenAddresses) == 0 {
+		log.Fatalf("no tracked token addresses configured from postgres or env")
+	}
+
 	log.Printf(
-		"listener supervisor started; chain_id=%d token_count=%d reconnect_delay=%s",
+		"listener supervisor started; chain_id=%d token_count=%d reconnect_delay=%s source=postgres_with_env_fallback",
 		cfg.Blockchain.ChainID,
-		len(cfg.Blockchain.TrackedTokenAddrs),
+		len(trackedTokenAddresses),
 		reconnectDelay,
 	)
 
@@ -37,7 +65,7 @@ func main() {
 			return
 		}
 
-		err := runListenerSession(ctx, *cfg)
+		err := runListenerSession(ctx, *cfg, trackedTokenAddresses)
 		if err == nil {
 			log.Println("listener stopped cleanly")
 			return
@@ -60,7 +88,15 @@ func main() {
 	}
 }
 
-func runListenerSession(ctx context.Context, cfg config.Config) error {
+func runListenerSession(
+	ctx context.Context,
+	cfg config.Config,
+	trackedTokenAddresses []string,
+) error {
+	if len(trackedTokenAddresses) == 0 {
+		return fmt.Errorf("trackedTokenAddresses is empty")
+	}
+
 	evmClient, err := blockchain.NewEVMClient(
 		ctx,
 		cfg.Blockchain.EVMWSURL,
@@ -136,7 +172,7 @@ func runListenerSession(ctx context.Context, cfg config.Config) error {
 
 	return subscriber.Subscribe(
 		ctx,
-		cfg.Blockchain.TrackedTokenAddrs,
+		trackedTokenAddresses,
 		handler,
 	)
 }

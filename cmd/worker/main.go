@@ -12,6 +12,7 @@ import (
 	"token-transfer-monitor/internal/broker"
 	"token-transfer-monitor/internal/config"
 	"token-transfer-monitor/internal/contract"
+	pgrepo "token-transfer-monitor/internal/repository/postgres"
 	"token-transfer-monitor/internal/service"
 	"token-transfer-monitor/internal/shutdown"
 	"token-transfer-monitor/internal/storage"
@@ -39,12 +40,28 @@ func main() {
 	}
 	defer pool.Close()
 
-	processor := service.NewTransferProcessor(pool, cfg.Blockchain.WatchlistAddrs)
+	watchlistRepo := pgrepo.NewWalletWatchlistRepo(pool)
+
+	watchlistAddresses, err := watchlistRepo.ListActiveAddresses(ctx)
+	if err != nil {
+		log.Fatalf("load wallet watchlist from postgres: %v", err)
+	}
+
+	if len(watchlistAddresses) == 0 {
+		watchlistAddresses = cfg.Blockchain.WatchlistAddrs
+		log.Printf(
+			"no active wallet watchlist found in postgres, fallback to env; wallet_count=%d",
+			len(watchlistAddresses),
+		)
+	}
+
+	processor := service.NewTransferProcessor(pool, watchlistAddresses)
 
 	log.Printf(
-		"worker supervisor started; queue=%s consumer_tag=%s reconnect_delay=%s",
+		"worker supervisor started; queue=%s consumer_tag=%s watchlist_count=%d reconnect_delay=%s source=postgres_with_env_fallback",
 		cfg.RabbitMQ.Topology.TransferQueue,
 		cfg.Worker.ConsumerTag,
+		len(watchlistAddresses),
 		reconnectDelay,
 	)
 
