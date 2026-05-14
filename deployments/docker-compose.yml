@@ -1,6 +1,62 @@
-version: "3.9"
-
 name: token-transfer-monitor
+
+x-app-env: &app-env
+  APP_NAME: ${APP_NAME:-token-transfer-monitor}
+  APP_ENV: ${APP_ENV:-development}
+  APP_PORT: ${APP_PORT:-8080}
+  LOG_LEVEL: ${LOG_LEVEL:-debug}
+
+  CHAIN_ID: ${CHAIN_ID:-11155111}
+  EVM_WS_URL: ${EVM_WS_URL:-}
+  EVM_HTTP_URL: ${EVM_HTTP_URL:-}
+  CONFIRMATION_BLOCKS: ${CONFIRMATION_BLOCKS:-0}
+  TRACKED_TOKEN_ADDRESSES: ${TRACKED_TOKEN_ADDRESSES:-}
+  WATCHLIST_ADDRESSES: ${WATCHLIST_ADDRESSES:-}
+
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: 5432
+  POSTGRES_DB: ${POSTGRES_DB:-ttm}
+  POSTGRES_USER: ${POSTGRES_USER:-ttm}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ttm_password}
+  POSTGRES_SSLMODE: disable
+  DATABASE_URL: postgres://${POSTGRES_USER:-ttm}:${POSTGRES_PASSWORD:-ttm_password}@postgres:5432/${POSTGRES_DB:-ttm}?sslmode=disable
+  POSTGRES_MAX_OPEN_CONNS: ${POSTGRES_MAX_OPEN_CONNS:-20}
+  POSTGRES_MIN_IDLE_CONNS: ${POSTGRES_MIN_IDLE_CONNS:-5}
+  POSTGRES_MAX_IDLE_TIME_SECONDS: ${POSTGRES_MAX_IDLE_TIME_SECONDS:-300}
+
+  RABBITMQ_HOST: rabbitmq
+  RABBITMQ_AMQP_PORT: 5672
+  RABBITMQ_MANAGEMENT_PORT: 15672
+  RABBITMQ_USER: ${RABBITMQ_USER:-ttm}
+  RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-ttm_password}
+  RABBITMQ_VHOST: ${RABBITMQ_VHOST:-/}
+  AMQP_URL: amqp://${RABBITMQ_USER:-ttm}:${RABBITMQ_PASSWORD:-ttm_password}@rabbitmq:5672/
+
+  RABBITMQ_MAIN_EXCHANGE: ${RABBITMQ_MAIN_EXCHANGE:-token.events}
+  RABBITMQ_MAIN_EXCHANGE_TYPE: ${RABBITMQ_MAIN_EXCHANGE_TYPE:-topic}
+
+  RABBITMQ_RETRY_EXCHANGE: ${RABBITMQ_RETRY_EXCHANGE:-token.retry}
+  RABBITMQ_RETRY_EXCHANGE_TYPE: ${RABBITMQ_RETRY_EXCHANGE_TYPE:-direct}
+
+  RABBITMQ_DLX_EXCHANGE: ${RABBITMQ_DLX_EXCHANGE:-token.dlx}
+  RABBITMQ_DLX_EXCHANGE_TYPE: ${RABBITMQ_DLX_EXCHANGE_TYPE:-direct}
+
+  RABBITMQ_TRANSFER_QUEUE: ${RABBITMQ_TRANSFER_QUEUE:-token.transfer.process}
+  RABBITMQ_TRANSFER_ROUTING_KEY: ${RABBITMQ_TRANSFER_ROUTING_KEY:-token.transfer.detected}
+
+  RABBITMQ_TRANSFER_RETRY_QUEUE: ${RABBITMQ_TRANSFER_RETRY_QUEUE:-token.transfer.process.retry.5s}
+  RABBITMQ_TRANSFER_RETRY_ROUTING_KEY: ${RABBITMQ_TRANSFER_RETRY_ROUTING_KEY:-token.transfer.retry}
+
+  RABBITMQ_TRANSFER_DLQ: ${RABBITMQ_TRANSFER_DLQ:-token.transfer.process.dlq}
+  RABBITMQ_TRANSFER_DLQ_ROUTING_KEY: ${RABBITMQ_TRANSFER_DLQ_ROUTING_KEY:-token.transfer.dead}
+
+  WORKER_CONSUMER_TAG: ${WORKER_CONSUMER_TAG:-transfer-worker}
+  WORKER_PREFETCH_COUNT: ${WORKER_PREFETCH_COUNT:-10}
+  MAX_RETRY_COUNT: ${MAX_RETRY_COUNT:-3}
+  RETRY_DELAY_MS: ${RETRY_DELAY_MS:-5000}
+
+  IDEMPOTENCY_ENABLED: ${IDEMPOTENCY_ENABLED:-true}
+  SHUTDOWN_TIMEOUT_SECONDS: ${SHUTDOWN_TIMEOUT_SECONDS:-15}
 
 services:
   postgres:
@@ -12,7 +68,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-ttm}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ttm_password}
     ports:
-      - "${POSTGRES_PORT:-5434}:5434"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -39,6 +95,108 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  api:
+    container_name: ttm-api
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        APP_NAME: api
+    environment:
+      <<: *app-env
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - app
+
+  worker:
+    container_name: ttm-worker
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        APP_NAME: worker
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    profiles:
+      - app
+
+  dlq-consumer:
+    container_name: ttm-dlq-consumer
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        APP_NAME: dlq-consumer
+    environment:
+      <<: *app-env
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    profiles:
+      - app
+
+  listener:
+    container_name: ttm-listener
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        APP_NAME: listener
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    profiles:
+      - listener
+
+  backfill:
+    container_name: ttm-backfill
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        APP_NAME: backfill
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    profiles:
+      - jobs
+
+  test-publisher:
+    container_name: ttm-test-publisher
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        APP_NAME: test-publisher
+    environment:
+      <<: *app-env
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    profiles:
+      - tools
 
 volumes:
   postgres_data:
