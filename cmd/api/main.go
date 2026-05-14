@@ -31,7 +31,15 @@ func main() {
 	defer pool.Close()
 
 	queryRepo := pgrepo.NewQueryRepo(pool)
-	handler := httpapi.NewHandler(queryRepo)
+	trackedTokenRepo := pgrepo.NewTrackedTokenRepo(pool)
+	watchlistRepo := pgrepo.NewWalletWatchlistRepo(pool)
+
+	handler := httpapi.NewHandler(
+		queryRepo,
+		trackedTokenRepo,
+		watchlistRepo,
+	)
+
 	router := httpapi.NewRouter(handler)
 
 	addr := fmt.Sprintf(":%d", cfg.App.Port)

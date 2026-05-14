@@ -22,7 +22,14 @@ func NewRouter(handler *Handler) http.Handler {
 	r.Get("/wallets/{address}/transfers", handler.ListTransfersByWallet)
 
 	r.Get("/tokens", handler.ListTokens)
+	r.Post("/tokens", handler.CreateToken)
+	r.Patch("/tokens/{id}", handler.UpdateToken)
+	r.Delete("/tokens/{id}", handler.DeleteToken)
+
 	r.Get("/watchlist", handler.ListWatchlist)
+	r.Post("/watchlist", handler.CreateWatchlist)
+	r.Patch("/watchlist/{id}", handler.UpdateWatchlist)
+	r.Delete("/watchlist/{id}", handler.DeleteWatchlist)
 
 	return r
 }
